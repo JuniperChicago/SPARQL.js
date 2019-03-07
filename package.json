@@ -1,6 +1,6 @@
 {
   "name": "sparqljs",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "A parser for the SPARQL query language",
   "author": "Ruben Verborgh <ruben.verborgh@gmail.com>",
   "keywords": [
@@ -36,11 +36,6 @@
     "mocha": "4.1.x",
     "chai": "4.1.x",
     "pre-commit": "~1.2.2"
-  },
-  "browser": {
-    "_process": false,
-    "fs": false,
-    "path": false
   },
   "pre-commit": [
     "build",
