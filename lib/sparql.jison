@@ -3,6 +3,8 @@
     SPARQL parser in the Jison parser generator format.
   */
 
+  var Wildcard = require('./Wildcard').Wildcard;
+
   // Common namespaces and entities
   var RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
       RDF_TYPE  = RDF + 'type',
@@ -13,9 +15,7 @@
       XSD_INTEGER  = XSD + 'integer',
       XSD_DECIMAL  = XSD + 'decimal',
       XSD_DOUBLE   = XSD + 'double',
-      XSD_BOOLEAN  = XSD + 'boolean',
-      XSD_TRUE =  '"true"^^'  + XSD_BOOLEAN,
-      XSD_FALSE = '"false"^^' + XSD_BOOLEAN;
+      XSD_BOOLEAN  = XSD + 'boolean';
 
   var base = '', basePath = '', baseRoot = '';
 
@@ -89,8 +89,7 @@
   function toVar(variable) {
     if (variable) {
       var first = variable[0];
-      if (first === '?') return variable;
-      if (first === '$') return '?' + variable.substr(1);
+      if (first === '?' || first === '$') return Parser.factory.variable(variable.substr(1));
     }
     return variable;
   }
@@ -102,7 +101,7 @@
 
   // Creates an expression with the given type and attributes
   function expression(expr, attr) {
-    var expression = { expression: expr };
+    var expression = { expression: expr === '*'? new Wildcard() : expr };
     if (attr)
       for (var a in attr)
         expression[a] = attr[a];
@@ -122,14 +121,17 @@
   }
 
   // Group datasets by default and named
-  function groupDatasets(fromClauses) {
-    var defaults = [], named = [], l = fromClauses.length, fromClause;
+  function groupDatasets(fromClauses, groupName) {
+    var defaults = [], named = [], l = fromClauses.length, fromClause, group = {};
+    if (!l)
+      return null;
     for (var i = 0; i < l && (fromClause = fromClauses[i]); i++)
       (fromClause.named ? named : defaults).push(fromClause.iri);
-    return l ? { from: { default: defaults, named: named } } : null;
+    group[groupName || 'from'] = { default: defaults, named: named };
+    return group;
   }
 
-  // Converts the number to a string
+  // Converts the string to a number
   function toInt(string) {
     return parseInt(string, 10);
   }
@@ -140,8 +142,16 @@
   }
 
   // Creates a literal with the given value and type
-  function createLiteral(value, type) {
-    return '"' + value + '"^^' + type;
+  function createTypedLiteral(value, type) {
+    if (type && type.termType !== 'NamedNode'){
+      type = Parser.factory.namedNode(type);
+    }
+    return Parser.factory.literal(value, type);
+  }
+
+  // Creates a literal with the given value and language
+  function createLangLiteral(value, lang) {
+    return Parser.factory.literal(value, lang);
   }
 
   // Creates a triple with the given subject, predicate, and object
@@ -153,9 +163,13 @@
     return triple;
   }
 
-  // Creates a new blank node identifier
-  function blank() {
-    return '_:b' + blankId++;
+  // Creates a new blank node
+  function blank(name) {
+    if (typeof name === 'string') {  // Only use name if a name is given
+      if (name.startsWith('e_')) return Parser.factory.blankNode(name);
+      return Parser.factory.blankNode('e_' + name);
+    }
+    return Parser.factory.blankNode('g_' + blankId++);
   };
   var blankId = 0;
   Parser._resetBlanks = function () { blankId = 0; }
@@ -191,7 +205,7 @@
       });
     }
     catch (error) { return ''; }
-    return '"' + string + '"';
+    return string;
   }
 
   // Creates a list, collecting its (possibly blank) items and triples associated with those items
@@ -201,8 +215,8 @@
 
     // Build an RDF list out of the items
     for (var i = 0, j = 0, l = listItems.length, listTriples = Array(l * 2); i < l;)
-      listTriples[j++] = triple(head, RDF_FIRST, listItems[i]),
-      listTriples[j++] = triple(head, RDF_REST,  head = ++i < l ? blank() : RDF_NIL);
+      listTriples[j++] = triple(head, Parser.factory.namedNode(RDF_FIRST), listItems[i]),
+      listTriples[j++] = triple(head, Parser.factory.namedNode(RDF_REST),  head = ++i < l ? blank() : Parser.factory.namedNode(RDF_NIL));
 
     // Return the list's identifier, its triples, and the triples associated with its items
     return { entity: list, triples: appendAllTo(listTriples, triples) };
@@ -252,16 +266,107 @@
     }
     return merged;
   }
+
+  // Return the id of an expression
+  function getExpressionId(expression) {
+    return expression.variable ? expression.variable.value : expression.value || expression.expression.value;
+  }
+
+  // Get all "aggregate"'s from an expression
+  function getAggregatesOfExpression(expression) {
+    if (!expression) {
+      return [];
+    }
+    if (expression.type === 'aggregate') {
+      return [expression];
+    } else if (expression.type === "operation") {
+      const aggregates = [];
+      for (const arg of expression.args) {
+        aggregates.push(...getAggregatesOfExpression(arg));
+      }
+      return aggregates;
+    }
+    return [];
+  }
+
+  // Get all variables used in an expression
+  function getVariablesFromExpression(expression) {
+    const variables = new Set();
+    const visitExpression = function (expr) {
+      if (!expr) { return; }
+      if (expr.termType === "Variable") {
+        variables.add(expr);
+      } else if (expr.type === "operation") {
+        expr.args.forEach(visitExpression);
+      }
+    };
+    visitExpression(expression);
+    return variables;
+  }
+
+  // Helper function to flatten arrays
+  function flatten(input, depth = 1, stack = []) {
+    for (const item of input) {
+        if (depth > 0 && item instanceof Array) {
+          flatten(item, depth - 1, stack);
+        } else {
+          stack.push(item);
+        }
+    }
+    return stack;
+  }
+
+  function isVariable(term) {
+    return term.termType === 'Variable';
+  }
+
+  function getBoundVarsFromGroupGraphPattern(pattern) {
+    if (pattern.triples) {
+      const boundVars = [];
+      for (const triple of pattern.triples) {
+        if (isVariable(triple.subject)) boundVars.push(triple.subject.value);
+        if (isVariable(triple.predicate)) boundVars.push(triple.predicate.value);
+        if (isVariable(triple.object)) boundVars.push(triple.object.value);
+      }
+      return boundVars;
+    } else if (pattern.patterns) {
+      const boundVars = [];
+      for (const pat of pattern.patterns) {
+        boundVars.push(...getBoundVarsFromGroupGraphPattern(pat));
+      }
+      return boundVars;
+    }
+    return [];
+  }
+
+  // Helper function to find duplicates in array
+  function getDuplicatesInArray(array) {
+    const sortedArray = array.slice().sort();
+    const duplicates = [];
+    for (let i = 0; i < sortedArray.length - 1; i++) {
+      if (sortedArray[i + 1] == sortedArray[i]) {
+        duplicates.push(sortedArray[i]);
+      }
+    }
+    return duplicates;
+  }
+
+  function ensureSparqlStar(value) {
+    if (!Parser.sparqlStar) {
+      throw new Error('SPARQL* support is not enabled');
+    }
+    return value;
+  }
 %}
 
 %lex
 
-IRIREF                "<"([^<>\"\{\}\|\^`\\\u0000-\u0020])*">"
+IRIREF                "<"(?:[^<>\"\{\}\|\^`\\\u0000-\u0020])*">"
 PNAME_NS              {PN_PREFIX}?":"
 PNAME_LN              {PNAME_NS}{PN_LOCAL}
-BLANK_NODE_LABEL      "_:"({PN_CHARS_U}|[0-9])(({PN_CHARS}|".")*{PN_CHARS})?
+BLANK_NODE_LABEL      "_:"(?:{PN_CHARS_U}|[0-9])(?:(?:{PN_CHARS}|".")*{PN_CHARS})?
 VAR                   [\?\$]{VARNAME}
-LANGTAG               "@"[a-zA-Z]+("-"[a-zA-Z0-9]+)*
+LANGTAG               "@"[a-zA-Z]+(?:"-"[a-zA-Z0-9]+)*
 INTEGER               [0-9]+
 DECIMAL               [0-9]*"."[0-9]+
 DOUBLE                [0-9]+"."[0-9]*{EXPONENT}|"."([0-9])+{EXPONENT}|([0-9])+{EXPONENT}
@@ -272,23 +377,23 @@ INTEGER_NEGATIVE      "-"{INTEGER}
 DECIMAL_NEGATIVE      "-"{DECIMAL}
 DOUBLE_NEGATIVE       "-"{DOUBLE}
 EXPONENT              [eE][+-]?[0-9]+
-STRING_LITERAL1       "'"(([^\u0027\u005C\u000A\u000D])|{ECHAR})*"'"
-STRING_LITERAL2       "\""(([^\u0022\u005C\u000A\u000D])|{ECHAR})*'"'
-STRING_LITERAL_LONG1  "'''"(("'"|"''")?([^'\\]|{ECHAR}))*"'''"
-STRING_LITERAL_LONG2  "\"\"\""(("\""|'""')?([^\"\\]|{ECHAR}))*'"""'
+STRING_LITERAL1       "'"(?:(?:[^\u0027\u005C\u000A\u000D])|{ECHAR})*"'"
+STRING_LITERAL2       "\""(?:(?:[^\u0022\u005C\u000A\u000D])|{ECHAR})*'"'
+STRING_LITERAL_LONG1  "'''"(?:(?:"'"|"''")?(?:[^'\\]|{ECHAR}))*"'''"
+STRING_LITERAL_LONG2  "\"\"\""(?:(?:"\""|'""')?(?:[^\"\\]|{ECHAR}))*'"""'
 ECHAR                 "\\"[tbnrf\\\"']|"\\u"{HEX}{HEX}{HEX}{HEX}|"\\U"{HEX}{HEX}{HEX}{HEX}{HEX}{HEX}{HEX}{HEX}
 NIL                   "("{WS}*")"
 WS                    \u0020|\u0009|\u000D|\u000A
 ANON                  "["{WS}*"]"
-PN_CHARS_BASE         [A-Z]|[a-z]|[\u00C0-\u00D6]|[\u00D8-\u00F6]|[\u00F8-\u02FF]|[\u0370-\u037D]|[\u037F-\u1FFF]|[\u200C-\u200D]|[\u2070-\u218F]|[\u2C00-\u2FEF]|[\u3001-\uD7FF]|[\uF900-\uFDCF]|[\uFDF0-\uFFFD]|[\uD800-\uDB7F][\uDC00-\uDFFF]
+PN_CHARS_BASE         [A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD]|[\uD800-\uDB7F][\uDC00-\uDFFF]
 PN_CHARS_U            (?:{PN_CHARS_BASE}|"_")
-VARNAME               ({PN_CHARS_U}|[0-9])({PN_CHARS_U}|[0-9]|\u00B7|[\u0300-\u036F]|[\u203F-\u2040])*
-PN_CHARS              {PN_CHARS_U}|"-"|[0-9]|\u00B7|[\u0300-\u036F]|[\u203F-\u2040]
-PN_PREFIX             {PN_CHARS_BASE}(({PN_CHARS}|".")*{PN_CHARS})?
-PN_LOCAL              ({PN_CHARS_U}|":"|[0-9]|{PLX})(({PN_CHARS}|"."|":"|{PLX})*({PN_CHARS}|":"|{PLX}))?
+VARNAME               (?:{PN_CHARS_U}|[0-9])(?:{PN_CHARS_U}|[0-9]|\u00B7|[\u0300-\u036F\u203F-\u2040])*
+PN_CHARS              {PN_CHARS_U}|"-"|[0-9]|\u00B7|[\u0300-\u036F\u203F-\u2040]
+PN_PREFIX             {PN_CHARS_BASE}(?:(?:{PN_CHARS}|".")*{PN_CHARS})?
+PN_LOCAL              (?:{PN_CHARS_U}|":"|[0-9]|{PLX})(?:(?:{PN_CHARS}|"."|":"|{PLX})*(?:{PN_CHARS}|":"|{PLX}))?
 PLX                   {PERCENT}|{PN_LOCAL_ESC}
 PERCENT               "%"{HEX}{HEX}
-HEX                   [0-9]|[A-F]|[a-f]
+HEX                   [0-9A-Fa-f]
 PN_LOCAL_ESC          "\\"("_"|"~"|"."|"-"|"!"|"$"|"&"|"'"|"("|")"|"*"|"+"|","|";"|"="|"/"|"?"|"#"|"@"|"%")
 
 %options flex case-insensitive
@@ -351,6 +456,8 @@ PN_LOCAL_ESC          "\\"("_"|"~"|"."|"-"|"!"|"$"|"&"|"'"|"("|")"|"*"|"+"|","|"
 "MINUS"                  return 'MINUS'
 "UNION"                  return 'UNION'
 "FILTER"                 return 'FILTER'
+"<<"                     return '<<'
+">>"                     return '>>'
 ","                      return ','
 "a"                      return 'a'
 "|"                      return '|'
@@ -389,8 +496,7 @@ PN_LOCAL_ESC          "\\"("_"|"~"|"."|"-"|"!"|"$"|"&"|"'"|"("|")"|"*"|"+"|","|"
 "GROUP_CONCAT"           return 'GROUP_CONCAT'
 "SEPARATOR"              return 'SEPARATOR'
 "^^"                     return '^^'
-"true"                   return 'true'
-"false"                  return 'false'
+"true"|"false"           return 'BOOLEAN'
 {IRIREF}                 return 'IRIREF'
 {PNAME_NS}               return 'PNAME_NS'
 {PNAME_LN}               return 'PNAME_LN'
@@ -458,24 +564,76 @@ PrefixDecl
     }
     ;
 SelectQuery
-    : SelectClause DatasetClause* WhereClause SolutionModifier -> extend($1, groupDatasets($2), $3, $4)
+    : SelectClauseWildcard DatasetClause* WhereClause SolutionModifierNoGroup -> extend($1, groupDatasets($2), $3, $4)
+    | SelectClauseVars     DatasetClause* WhereClause SolutionModifier
+    {
+      // Check for projection of ungrouped variable
+      const counts = flatten($1.variables.map(vars => getAggregatesOfExpression(vars.expression)))
+        .some(agg => agg.aggregation === "count");
+      if (counts || $4.group) {
+        for (const selectVar of $1.variables) {
+          if (selectVar.termType === "Variable") {
+            if (!$4.group || !$4.group.map(groupVar => getExpressionId(groupVar)).includes(getExpressionId(selectVar))) {
+              throw Error("Projection of ungrouped variable (?" + getExpressionId(selectVar) + ")");
+            }
+          } else if (getAggregatesOfExpression(selectVar.expression).length === 0) {
+            const usedVars = getVariablesFromExpression(selectVar.expression);
+            for (const usedVar of usedVars) {
+              if (!$4.group.map(groupVar => getExpressionId(groupVar)).includes(getExpressionId(usedVar))) {
+                throw Error("Use of ungrouped variable in projection of operation (?" + getExpressionId(usedVar) + ")");
+              }
+            }
+          }
+        }
+      }
+      // Check if id of each AS-selected column is not yet bound by subquery
+      const subqueries = $3.where.filter(w => w.type === "query");
+      if (subqueries.length > 0) {
+        const selectedVarIds = $1.variables.filter(v => v.variable && v.variable.value).map(v => v.variable.value);
+        const subqueryIds = flatten(subqueries.map(sub => sub.variables)).map(v => v.value || v.variable.value);
+        for (const selectedVarId of selectedVarIds) {
+          if (subqueryIds.indexOf(selectedVarId) >= 0) {
+            throw Error("Target id of 'AS' (?" + selectedVarId + ") already used in subquery");
+          }
+        }
+      }
+      $$ = extend($1, groupDatasets($2), $3, $4)
+    }
+    ;
+SelectClauseWildcard
+    : SelectClauseBase '*' -> extend($1, {variables: [new Wildcard()]})
+    ;
+SelectClauseVars
+    : SelectClauseBase SelectClauseItem+
+    {
+      // Check if id of each selected column is different
+      const selectedVarIds = $2.map(v => v.value || v.variable.value);
+      const duplicates = getDuplicatesInArray(selectedVarIds);
+      if (duplicates.length > 0) {
+        throw Error("Two or more of the resulting columns have the same name (?" + duplicates[0] + ")");
+      }
+
+      $$ = extend($1, { variables: $2 })
+    }
+    ;
+SelectClauseBase
+    : 'SELECT' ( 'DISTINCT' | 'REDUCED' )? -> extend({ queryType: 'SELECT'}, $2 && ($1 = lowercase($2), $2 = {}, $2[$1] = true, $2))
     ;
 SubSelect
-    : SelectClause WhereClause SolutionModifier ValuesClause? -> extend($1, $2, $3, $4, { type: 'query' })
-    ;
-SelectClause
-    : 'SELECT' ( 'DISTINCT' | 'REDUCED' )? ( SelectClauseItem+ | '*' ) -> extend({ queryType: 'SELECT', variables: $3 === '*' ? ['*'] : $3 }, $2 && ($1 = lowercase($2), $2 = {}, $2[$1] = true, $2))
+    : SelectClauseWildcard WhereClause SolutionModifierNoGroup ValuesClause? -> extend($1, $2, $3, $4, { type: 'query' })
+    | SelectClauseVars     WhereClause SolutionModifier        ValuesClause? -> extend($1, $2, $3, $4, { type: 'query' })
     ;
 SelectClauseItem
     : VAR -> toVar($1)
     | '(' Expression 'AS' VAR ')' -> expression($2, { variable: toVar($4) })
+    | '(' VarTriple 'AS' VAR ')' -> ensureSparqlStar(expression($2, { variable: toVar($4) }))
     ;
 ConstructQuery
     : 'CONSTRUCT' ConstructTemplate DatasetClause* WhereClause SolutionModifier -> extend({ queryType: 'CONSTRUCT', template: $2 }, groupDatasets($3), $4, $5)
     | 'CONSTRUCT' DatasetClause* 'WHERE' '{' TriplesTemplate? '}' SolutionModifier -> extend({ queryType: 'CONSTRUCT', template: $5 = ($5 ? $5.triples : []) }, groupDatasets($2), { where: [ { type: 'bgp', triples: appendAllTo([], $5) } ] }, $7)
     ;
 DescribeQuery
-    : 'DESCRIBE' ( (VAR | iri)+ | '*' ) DatasetClause* WhereClause? SolutionModifier -> extend({ queryType: 'DESCRIBE', variables: $2 === '*' ? ['*'] : $2.map(toVar) }, groupDatasets($3), $4, $5)
+    : 'DESCRIBE' ( (VAR | iri)+ | '*' ) DatasetClause* WhereClause? SolutionModifier -> extend({ queryType: 'DESCRIBE', variables: $2 === '*' ? [new Wildcard()] : $2.map(toVar) }, groupDatasets($3), $4, $5)
     ;
 AskQuery
     : 'ASK' DatasetClause* WhereClause SolutionModifier -> extend({ queryType: 'ASK' }, groupDatasets($2), $3, $4)
@@ -487,7 +645,10 @@ WhereClause
     : 'WHERE'? GroupGraphPattern -> { where: $2.patterns }
     ;
 SolutionModifier
-    : GroupClause? HavingClause? OrderClause? LimitOffsetClauses? -> extend($1, $2, $3, $4)
+    : GroupClause? SolutionModifierNoGroup -> extend($1, $2)
+    ;
+SolutionModifierNoGroup
+    : HavingClause? OrderClause? LimitOffsetClauses? -> extend($1, $2, $3)
     ;
 GroupClause
     : 'GROUP' 'BY' GroupCondition+ -> { group: $3 }
@@ -523,7 +684,6 @@ ValuesClause
 InlineData
     : VAR '{' DataBlockValue* '}'
     {
-      $1 = toVar($1);
       $$ = $3.map(function(v) { var o = {}; o[$1] = v; return o; })
     }
     |
@@ -540,7 +700,7 @@ InlineData
           throw Error('Inconsistent VALUES length');
         var valuesObject = {};
         for(var i = 0; i<length; i++)
-          valuesObject[$2[i]] = values[i];
+          valuesObject['?' + $2[i].value] = values[i];
         return valuesObject;
       });
     }
@@ -548,6 +708,7 @@ InlineData
 DataBlockValue
     : iri
     | Literal
+    | ConstTriple -> ensureSparqlStar($1)
     | 'UNDEF' -> undefined
     ;
 DataBlockValueList
@@ -564,8 +725,8 @@ Update1
     | 'INSERTDATA'  QuadPattern -> { updateType: 'insert',      insert: $2 }
     | 'DELETEDATA'  QuadPattern -> { updateType: 'delete',      delete: $2 }
     | 'DELETEWHERE' QuadPattern -> { updateType: 'deletewhere', delete: $2 }
-    | WithClause? InsertClause DeleteClause? UsingClause* 'WHERE' GroupGraphPattern -> extend({ updateType: 'insertdelete' }, $1, { insert: $2 || [] }, { delete: $3 || [] }, groupDatasets($4), { where: $6.patterns })
-    | WithClause? DeleteClause InsertClause? UsingClause* 'WHERE' GroupGraphPattern -> extend({ updateType: 'insertdelete' }, $1, { delete: $2 || [] }, { insert: $3 || [] }, groupDatasets($4), { where: $6.patterns })
+    | WithClause? InsertClause DeleteClause? UsingClause* 'WHERE' GroupGraphPattern -> extend({ updateType: 'insertdelete' }, $1, { insert: $2 || [] }, { delete: $3 || [] }, groupDatasets($4, 'using'), { where: $6.patterns })
+    | WithClause? DeleteClause InsertClause? UsingClause* 'WHERE' GroupGraphPattern -> extend({ updateType: 'insertdelete' }, $1, { delete: $2 || [] }, { insert: $3 || [] }, groupDatasets($4, 'using'), { where: $6.patterns })
     ;
 DeleteClause
     : 'DELETE' QuadPattern -> $2
@@ -605,7 +766,25 @@ TriplesTemplate
     ;
 GroupGraphPattern
     : '{' SubSelect '}' -> { type: 'group', patterns: [ $2 ] }
-    | '{' GroupGraphPatternSub '}' -> { type: 'group', patterns: $2 }
+    | '{' GroupGraphPatternSub '}'
+    {
+      // For every binding
+      for (const binding of $2.filter(el => el.type === "bind")) {
+        const index = $2.indexOf(binding);
+        const boundVars = new Set();
+        //Collect all bounded variables before the binding
+        for (const el of $2.slice(0, index)) {
+          if (el.type === "group" || el.type === "bgp") {
+            getBoundVarsFromGroupGraphPattern(el).forEach(boundVar => boundVars.add(boundVar));
+          }
+        }
+        // If binding with a non-free variable, throw error
+        if (boundVars.has(binding.variable.value)) {
+          throw Error("Variable used to bind is already bound (?" + binding.variable.value + ")");
+        }
+      }
+      $$ = { type: 'group', patterns: $2 }
+    }
     ;
 GroupGraphPatternSub
     : TriplesBlock? GroupGraphPatternSubTail* -> $1 ? unionAll([$1], $2) : unionAll($2)
@@ -630,6 +809,7 @@ GraphPatternNotTriples
     | 'SERVICE' 'SILENT'? (VAR | iri) GroupGraphPattern -> extend($4, { type: 'service', name: toVar($3), silent: !!$2 })
     | 'FILTER' Constraint -> { type: 'filter', expression: $2 }
     | 'BIND' '(' Expression 'AS' VAR ')' -> { type: 'bind', variable: toVar($5), expression: $3 }
+    | 'BIND' '(' VarTriple 'AS' VAR ')' -> ensureSparqlStar({ type: 'bind', variable: toVar($5), expression: $3 })
     | ValuesClause
     ;
 Constraint
@@ -652,7 +832,7 @@ ConstructTriples
     : (TriplesSameSubject '.')* TriplesSameSubject '.'? -> unionAll($1, [$2])
     ;
 TriplesSameSubject
-    : VarOrTerm PropertyListNotEmpty -> $2.map(function (t) { return extend(triple($1), t); })
+    : (VarOrTerm | VarTriple) PropertyListNotEmpty -> $2.map(function (t) { return extend(triple($1), t); })
     | TriplesNode PropertyList -> appendAllTo($2.map(function (t) { return extend(triple($1.entity), t); }), $1.triples) /* the subject is a blank node, possibly with more triples */
     ;
 PropertyList
@@ -670,13 +850,13 @@ VerbObjectList
 Verb
     : VAR -> toVar($1)
     | iri
-    | 'a' -> RDF_TYPE
+    | 'a' -> Parser.factory.namedNode(RDF_TYPE)
     ;
 ObjectList
     : (GraphNode ',')* GraphNode -> appendTo($1, $2)
     ;
 TriplesSameSubjectPath
-    : VarOrTerm PropertyListPathNotEmpty -> $2.map(function (t) { return extend(triple($1), t); })
+    : (VarOrTerm | VarTriple) PropertyListPathNotEmpty -> $2.map(function (t) { return extend(triple($1), t); })
     | TriplesNodePath PropertyListPathNotEmpty? -> !$2 ? $1.triples : appendAllTo($2.map(function (t) { return extend(triple($1.entity), t); }), $1.triples) /* the subject is a blank node, possibly with more triples */
     ;
 PropertyListPathNotEmpty
@@ -700,7 +880,7 @@ PathEltOrInverse
     ;
 PathPrimary
     : iri
-    | 'a' -> RDF_TYPE
+    | 'a' -> Parser.factory.namedNode(RDF_TYPE)
     | '!' PathNegatedPropertySet -> path($1, [$2])
     | '(' Path ')' -> $2
     ;
@@ -711,9 +891,9 @@ PathNegatedPropertySet
     ;
 PathOneInPropertySet
     : iri
-    | 'a' -> RDF_TYPE
+    | 'a' -> Parser.factory.namedNode(RDF_TYPE)
     | '^' iri -> path($1, [$2])
-    | '^' 'a' -> path($1, [RDF_TYPE])
+    | '^' 'a' -> path($1, [Parser.factory.namedNode(RDF_TYPE)])
     ;
 TriplesNode
     : '(' GraphNode+ ')' -> createList($2)
@@ -724,20 +904,31 @@ TriplesNodePath
     | '[' PropertyListPathNotEmpty ']' -> createAnonymousObject($2)
     ;
 GraphNode
-    : VarOrTerm -> { entity: $1, triples: [] } /* for consistency with TriplesNode */
+    : (VarOrTerm | VarTriple) -> { entity: $1, triples: [] } /* for consistency with TriplesNode */
     | TriplesNode
     ;
 GraphNodePath
-    : VarOrTerm -> { entity: $1, triples: [] } /* for consistency with TriplesNodePath */
+    : (VarOrTerm | VarTriple) -> { entity: $1, triples: [] } /* for consistency with TriplesNodePath */
     | TriplesNodePath
+    ;
+VarTriple
+    : '<<' 'GRAPH' (VAR | iri) '{' (VarTriple | VarOrTerm) Verb (VarTriple | VarOrTerm) '}' '>>' -> ensureSparqlStar(Parser.factory.quad($5, $6, $7, toVar($3)))
+    | '<<' (VarTriple | VarOrTerm) Verb (VarTriple | VarOrTerm) '>>' -> ensureSparqlStar(Parser.factory.quad($2, $3, $4))
+    ;
+ConstTriple
+    : '<<' 'GRAPH' (VAR | iri) '{' (ConstTriple | Term) Verb (ConstTriple | Term) '}' '>>' -> ensureSparqlStar(Parser.factory.quad($5, $6, $7, toVar($3)))
+    | '<<' (ConstTriple | Term) Verb (ConstTriple | Term) '>>' -> ensureSparqlStar(Parser.factory.quad($2, $3, $4))
     ;
 VarOrTerm
     : VAR -> toVar($1)
-    | iri
+    | Term
+    ;
+Term
+    : iri
     | Literal
-    | BLANK_NODE_LABEL
+    | BLANK_NODE_LABEL -> blank($1.replace(/^(_:)/,''));
     | ANON -> blank()
-    | NIL  -> RDF_NIL
+    | NIL  -> Parser.factory.namedNode(RDF_NIL)
     ;
 Expression
     : ConditionalAndExpression ExpressionTail* -> createOperationTree($1, $2)
@@ -762,7 +953,11 @@ AdditiveExpression
 AdditiveExpressionTail
     : ( '+' | '-' ) MultiplicativeExpression -> [$1, $2]
     | NumericLiteralPositive MultiplicativeExpressionTail* -> ['+', createOperationTree($1, $2)]
-    | NumericLiteralNegative MultiplicativeExpressionTail* -> ['-', createOperationTree($1.replace('-', ''), $2)]
+    | NumericLiteralNegative MultiplicativeExpressionTail*
+    {
+      var negatedLiteral = createTypedLiteral($1.value.replace('-', ''), $1.datatype);
+      $$ = ['-', createOperationTree(negatedLiteral, $2)];
+    }
     ;
 MultiplicativeExpression
     : UnaryExpression MultiplicativeExpressionTail* -> createOperationTree($1, $2)
@@ -804,19 +999,18 @@ Aggregate
     | 'GROUP_CONCAT' '(' 'DISTINCT'? Expression GroupConcatSeparator? ')'  -> expression($4, { type: 'aggregate', aggregation: lowercase($1), distinct: !!$3, separator: $5 || ' ' })
     ;
 GroupConcatSeparator
-    : ';' 'SEPARATOR' '=' String -> $4.substr(1, $4.length - 2)
+    : ';' 'SEPARATOR' '=' String -> $4
     ;
 Literal
-    : String
-    | String LANGTAG  -> $1 + lowercase($2)
-    | String '^^' iri -> $1 + '^^' + $3
-    | INTEGER -> createLiteral($1, XSD_INTEGER)
-    | DECIMAL -> createLiteral($1, XSD_DECIMAL)
-    | DOUBLE  -> createLiteral(lowercase($1), XSD_DOUBLE)
+    : String -> createTypedLiteral($1)
+    | String LANGTAG  -> createLangLiteral($1, lowercase($2.substr(1)))
+    | String '^^' iri -> createTypedLiteral($1, $3)
+    | INTEGER -> createTypedLiteral($1, XSD_INTEGER)
+    | DECIMAL -> createTypedLiteral($1, XSD_DECIMAL)
+    | DOUBLE  -> createTypedLiteral(lowercase($1), XSD_DOUBLE)
     | NumericLiteralPositive
     | NumericLiteralNegative
-    | 'true'  -> XSD_TRUE
-    | 'false' -> XSD_FALSE
+    | BOOLEAN -> createTypedLiteral($1.toLowerCase(), XSD_BOOLEAN)
     ;
 String
     : STRING_LITERAL1 -> unescapeString($1, 1)
@@ -825,29 +1019,31 @@ String
     | STRING_LITERAL_LONG2 -> unescapeString($1, 3)
     ;
 NumericLiteralPositive
-    : INTEGER_POSITIVE -> createLiteral($1.substr(1), XSD_INTEGER)
-    | DECIMAL_POSITIVE -> createLiteral($1.substr(1), XSD_DECIMAL)
-    | DOUBLE_POSITIVE  -> createLiteral($1.substr(1).toLowerCase(), XSD_DOUBLE)
+    : INTEGER_POSITIVE -> createTypedLiteral($1.substr(1), XSD_INTEGER)
+    | DECIMAL_POSITIVE -> createTypedLiteral($1.substr(1), XSD_DECIMAL)
+    | DOUBLE_POSITIVE  -> createTypedLiteral($1.substr(1).toLowerCase(), XSD_DOUBLE)
     ;
 NumericLiteralNegative
-    : INTEGER_NEGATIVE -> createLiteral($1, XSD_INTEGER)
-    | DECIMAL_NEGATIVE -> createLiteral($1, XSD_DECIMAL)
-    | DOUBLE_NEGATIVE  -> createLiteral(lowercase($1), XSD_DOUBLE)
+    : INTEGER_NEGATIVE -> createTypedLiteral($1, XSD_INTEGER)
+    | DECIMAL_NEGATIVE -> createTypedLiteral($1, XSD_DECIMAL)
+    | DOUBLE_NEGATIVE  -> createTypedLiteral(lowercase($1), XSD_DOUBLE)
     ;
 iri
-    : IRIREF -> resolveIRI($1)
+    : IRIREF -> Parser.factory.namedNode(resolveIRI($1))
     | PNAME_LN
     {
       var namePos = $1.indexOf(':'),
           prefix = $1.substr(0, namePos),
           expansion = Parser.prefixes[prefix];
       if (!expansion) throw new Error('Unknown prefix: ' + prefix);
-      $$ = resolveIRI(expansion + $1.substr(namePos + 1));
+      var uriString = resolveIRI(expansion + $1.substr(namePos + 1));
+      $$ = Parser.factory.namedNode(uriString);
     }
     | PNAME_NS
     {
       $1 = $1.substr(0, $1.length - 1);
       if (!($1 in Parser.prefixes)) throw new Error('Unknown prefix: ' + $1);
-      $$ = resolveIRI(Parser.prefixes[$1]);
+      var uriString = resolveIRI(Parser.prefixes[$1]);
+      $$ = Parser.factory.namedNode(uriString);
     }
     ;

@@ -6,6 +6,8 @@
 The [SPARQL 1.1 Query Language](http://www.w3.org/TR/sparql11-query/) allows to query datasources of [RDF triples](http://www.w3.org/TR/rdf11-concepts/).
 SPARQL.js translates SPARQL into JSON and back,
 so you can parse and build SPARQL queries in your JavaScript applications.
+It also contains support for the [SPARQL*](https://blog.liu.se/olafhartig/2019/01/10/position-statement-rdf-star-and-sparql-star/) extension
+under the `sparqlStar` option.
 
 It fully supports the [SPARQL 1.1 specification](http://www.w3.org/TR/sparql11-query/), including [property paths](http://www.w3.org/TR/sparql11-query/#propertypaths), [federation](http://www.w3.org/TR/sparql11-federated-query/), and [updates](http://www.w3.org/TR/sparql11-update/).
 
@@ -21,14 +23,17 @@ var parsedQuery = parser.parse(
 
 // Regenerate a SPARQL query from a JSON object
 var SparqlGenerator = require('sparqljs').Generator;
-var generator = new SparqlGenerator();
+var generator = new SparqlGenerator({ /* prefixes, baseIRI, factory, sparqlStar */ });
 parsedQuery.variables = ['?mickey'];
 var generatedQuery = generator.stringify(parsedQuery);
 ```
+Set `sparqlStar` to `true` to allow [SPARQL*](https://blog.liu.se/olafhartig/2019/01/10/position-statement-rdf-star-and-sparql-star/) syntax.
 ### Standalone
 ```bash
-$ sparql-to-json query.sparql
+$ sparql-to-json --strict query.sparql
 ```
+Parse [SPARQL*](https://blog.liu.se/olafhartig/2019/01/10/position-statement-rdf-star-and-sparql-star/) syntax by default.
+For pure [SPARQL 1.1](http://www.w3.org/TR/sparql11-query/), use the `--strict` flag.
 
 ## Representation
 Queries are represented in a JSON structure. The most easy way to get acquainted with this structure is to try the examples in the `queries` folder through `sparql-to-json`. All examples of the [SPARQL 1.1 specification](http://www.w3.org/TR/sparql11-query/) have been included, in case you wonder how a specific syntactical construct is represented.
@@ -46,38 +51,79 @@ SELECT ?p ?c WHERE {
 And here is the same query in JSON:
 ```JSON
 {
-  "type": "query",
-  "prefixes": {
-    "dbpedia-owl": "http://dbpedia.org/ontology/"
-  },
   "queryType": "SELECT",
-  "variables": [ "?p", "?c" ],
+  "variables": [
+    {
+      "termType": "Variable",
+      "value": "p"
+    },
+    {
+      "termType": "Variable",
+      "value": "c"
+    }
+  ],
   "where": [
     {
       "type": "bgp",
       "triples": [
         {
-          "subject": "?p",
-          "predicate": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
-          "object": "http://dbpedia.org/ontology/Artist"
+          "subject": {
+            "termType": "Variable",
+            "value": "p"
+          },
+          "predicate": {
+            "termType": "NamedNode",
+            "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+          },
+          "object": {
+            "termType": "NamedNode",
+            "value": "http://dbpedia.org/ontology/Artist"
+          }
         },
         {
-          "subject": "?p",
-          "predicate": "http://dbpedia.org/ontology/birthPlace",
-          "object": "?c"
+          "subject": {
+            "termType": "Variable",
+            "value": "p"
+          },
+          "predicate": {
+            "termType": "NamedNode",
+            "value": "http://dbpedia.org/ontology/birthPlace"
+          },
+          "object": {
+            "termType": "Variable",
+            "value": "c"
+          }
         },
         {
-          "subject": "?c",
-          "predicate": "http://xmlns.com/foaf/0.1/name",
-          "object": "\"York\"@en"
+          "subject": {
+            "termType": "Variable",
+            "value": "c"
+          },
+          "predicate": {
+            "termType": "NamedNode",
+            "value": "http://xmlns.com/foaf/0.1/name"
+          },
+          "object": {
+            "termType": "Literal",
+            "value": "York",
+            "language": "en",
+            "datatype": {
+              "termType": "NamedNode",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+            }
+          }
         }
       ]
     }
-  ]
+  ],
+  "type": "query",
+  "prefixes": {
+    "dbpedia-owl": "http://dbpedia.org/ontology/"
+  }
 }
 ```
 
-The representation of triples is the same as in [N3.js 0.x](https://github.com/rdfjs/N3.js/blob/v0.11.3/README.md#triple-representation), but will [switch to RDF/JS representation](http://rdf.js.org/) in the future.
+The representation of triples uses the [RDF/JS representation](http://rdf.js.org/).
 
 ## Installation
 ```bash
